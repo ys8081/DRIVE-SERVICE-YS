@@ -772,203 +772,29 @@ function zipDlServer(ids) {
 
   _pollZip(jobId, 0);
 }
-/* ---------- CLIENT ZIP: browser seedha Google se files leta hai, ZIP khud banata hai (Render bypass) ---------- */
-const CZ_SEG = 8 * 1024 * 1024, CZ_WINDOW = 12, CZ_BLOB_MAX = 2 * 1024 ** 3, CZ_ZIP_MAX = 3.9 * 1024 ** 3;
-const _CRC = (() => {
-  const T = new Uint32Array(256 * 8);
-  for (let i = 0; i < 256; i++) { let c = i; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; T[i] = c >>> 0; }
-  for (let k = 1; k < 8; k++) for (let i = 0; i < 256; i++) { const p = T[(k - 1) * 256 + i]; T[k * 256 + i] = ((p >>> 8) ^ T[p & 255]) >>> 0; }
-  return T;
-})();
-function crcUpdate(crc, u8) { // crc = raw running state (start 0xFFFFFFFF)
-  const T = _CRC; let i = 0; const n = u8.length;
-  for (; i + 8 <= n; i += 8) {
-    const a = (u8[i] | u8[i + 1] << 8 | u8[i + 2] << 16 | u8[i + 3] << 24) ^ crc;
-    const b = u8[i + 4] | u8[i + 5] << 8 | u8[i + 6] << 16 | u8[i + 7] << 24;
-    crc = T[1792 + (a & 255)] ^ T[1536 + ((a >>> 8) & 255)] ^ T[1280 + ((a >>> 16) & 255)] ^ T[1024 + (a >>> 24)] ^
-          T[768 + (b & 255)] ^ T[512 + ((b >>> 8) & 255)] ^ T[256 + ((b >>> 16) & 255)] ^ T[b >>> 24];
-  }
-  for (; i < n; i++) crc = T[(crc ^ u8[i]) & 255] ^ (crc >>> 8);
-  return crc >>> 0;
-}
-function _dosTime(d) {
-  return [((d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1)) & 0xFFFF,
-          (((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate()) & 0xFFFF];
-}
-class ZipWriter {
-  constructor(sink) { this.sink = sink; this.off = 0; this.cd = []; this.enc = new TextEncoder(); this.t = _dosTime(new Date()); }
-  async _w(u8) { await this.sink(u8); this.off += u8.length; }
-  async startFile(path, isDir) {
-    const name = this.enc.encode(path), h = new DataView(new ArrayBuffer(30));
-    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, isDir ? 0x0800 : 0x0808, true);
-    h.setUint16(8, 0, true); h.setUint16(10, this.t[0], true); h.setUint16(12, this.t[1], true);
-    h.setUint16(26, name.length, true);
-    const e = { name, isDir, off: this.off, crc: 0, size: 0, flags: isDir ? 0x0800 : 0x0808 };
-    this.cd.push(e);
-    await this._w(new Uint8Array(h.buffer)); await this._w(name);
-    return e;
-  }
-  async endFile(e) {
-    if (e.isDir) return;
-    const d = new DataView(new ArrayBuffer(16));
-    d.setUint32(0, 0x08074b50, true); d.setUint32(4, e.crc, true); d.setUint32(8, e.size, true); d.setUint32(12, e.size, true);
-    await this._w(new Uint8Array(d.buffer));
-  }
-  async finish() {
-    const start = this.off;
-    for (const e of this.cd) {
-      const c = new DataView(new ArrayBuffer(46));
-      c.setUint32(0, 0x02014b50, true); c.setUint16(4, 0x0314, true); c.setUint16(6, 20, true); c.setUint16(8, e.flags, true);
-      c.setUint16(12, this.t[0], true); c.setUint16(14, this.t[1], true);
-      c.setUint32(16, e.crc, true); c.setUint32(20, e.size, true); c.setUint32(24, e.size, true);
-      c.setUint16(28, e.name.length, true);
-      c.setUint32(38, e.isDir ? (((0o40775 << 16) | 0x10) >>> 0) : ((0o100644 << 16) >>> 0), true);
-      c.setUint32(42, e.off, true);
-      await this._w(new Uint8Array(c.buffer)); await this._w(e.name);
-    }
-    const size = this.off - start, n = this.cd.length, z = new DataView(new ArrayBuffer(22));
-    z.setUint32(0, 0x06054b50, true); z.setUint16(8, n, true); z.setUint16(10, n, true);
-    z.setUint32(12, size, true); z.setUint32(16, start, true);
-    await this._w(new Uint8Array(z.buffer));
-  }
-}
-
-async function czipRun(ids, zname, jobId, ctl) {
-  // returns true = done, false = shuru hone se pehle fail (server ZIP par fallback karo)
-  const tr = await fetch('/api/tree', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }), cache: 'no-store' });
-  const tree = await tr.json();
-  if (!tr.ok) throw new Error(tree.error || 'List nahi ban saki');
-  let token = tree.token, tokenExp = Date.now() + (tree.expires_in - 60) * 1000;
-  if (_zipJobId !== jobId) return true;
-  const entries = tree.entries, files = entries.filter((e) => !e.d);
-  const total = files.reduce((a, f) => a + (f.s || 0), 0);
-  if (total > CZ_ZIP_MAX) { toast('4GB se badi ZIP browser mein nahi banti, server route use ho raha hai'); return false; }
-
-  async function getToken() {
-    if (Date.now() > tokenExp) {
-      const r = await fetch('/api/token', { cache: 'no-store' }); const d = await r.json();
-      if (!r.ok) throw new Error('Token refresh fail');
-      token = d.token; tokenExp = Date.now() + (d.expires_in - 60) * 1000;
-    }
-    return token;
-  }
-  const urlOf = (f, t) => {
-    const b = 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(f.id);
-    return f.x ? b + '/export?mimeType=' + encodeURIComponent(f.x) + '&access_token=' + encodeURIComponent(t)
-               : b + '?alt=media&supportsAllDrives=true&access_token=' + encodeURIComponent(t);
-  };
-
-  // probe: CORS / token chal raha hai ya nahi - kuch likhne se pehle check
-  if (files.length) {
-    try {
-      const f = files.find((x) => x.s > 0 || x.x) || files[0];
-      const r = await fetch(urlOf(f, await getToken()), { headers: f.x ? {} : { Range: 'bytes=0-0' }, signal: ctl.signal });
-      if (!r.ok) throw new Error('probe ' + r.status);
-      if (r.body) r.body.cancel().catch(() => {});
-    } catch (e) { console.warn('client zip probe failed', e); return false; }
-  }
-
-  // output: desktop Chrome = seedha disk (RAM zero), baaki = Blob parts
-  let sink, finishOut;
-  const useFS = !!window.showSaveFilePicker;
-  if (!useFS && total > CZ_BLOB_MAX) { toast('Badi ZIP (2GB+) is device par browser mein nahi banti, server route use ho raha hai'); return false; }
-  if (useFS) {
-    let h;
-    try { h = await window.showSaveFilePicker({ suggestedName: zname, types: [{ description: 'ZIP', accept: { 'application/zip': ['.zip'] } }] }); }
-    catch (e) { if (e && e.name === 'AbortError') { _zipJobId = null; zipPanelHide(); return true; } return false; }
-    const w = await h.createWritable();
-    sink = (u8) => w.write(u8);
-    finishOut = async () => { await w.close(); };
-    ctl.abortOut = () => w.abort().catch(() => {});
-  } else {
-    const parts = [];
-    sink = (u8) => { parts.push(new Blob([u8])); };
-    finishOut = async () => {
-      const url = URL.createObjectURL(new Blob(parts, { type: 'application/zip' }));
-      const a = document.createElement('a'); a.href = url; a.download = zname;
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 10 * 60 * 1000);
-    };
-  }
-
-  // saare segments ka plan (order mein), window tak parallel prefetch
-  const tasks = [];
-  for (const f of files) {
-    f.segs = [];
-    if (f.x) f.segs.push([0, 0]);
-    else for (let st = 0; st < f.s; st += CZ_SEG) f.segs.push([st, Math.min(st + CZ_SEG, f.s) - 1]);
-    for (const sg of f.segs) tasks.push([f, sg[0], sg[1]]);
-  }
-  async function fetchSeg(f, st, en) {
-    let last;
-    for (let a = 0; a < 5; a++) {
-      if (ctl.signal.aborted) throw new Error('cancelled');
-      try {
-        const r = await fetch(urlOf(f, await getToken()), { headers: f.x ? {} : { Range: 'bytes=' + st + '-' + en }, signal: ctl.signal });
-        if (r.status === 401) { tokenExp = 0; throw new Error('401'); }
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        const buf = await r.arrayBuffer();
-        if (!f.x && buf.byteLength !== en - st + 1) throw new Error('short read');
-        return new Uint8Array(buf);
-      } catch (e) { last = e; if (ctl.signal.aborted) throw e; await new Promise((res) => setTimeout(res, Math.min(2 ** a, 8) * 400)); }
-    }
-    throw last;
-  }
-  const pending = []; let next = 0;
-  const fill = () => { while (pending.length < CZ_WINDOW && next < tasks.length) { const t = tasks[next++]; const p = fetchSeg(t[0], t[1], t[2]); p.catch(() => {}); pending.push(p); } };
-
-  const zw = new ZipWriter(sink), errors = []; let doneBytes = 0, doneFiles = 0;
+/* ---------- Folder / bahut saari files: har file seedha Google ke link se (ZIP nahi, Render nahi) ---------- */
+async function zipDl(ids) {
+  toast('Files ki list ban rahi hai\u2026');
+  let t;
   try {
-    for (const e of entries) {
-      if (_zipJobId !== jobId) throw new Error('cancelled');
-      if (e.d) { const ent = await zw.startFile(e.p, true); await zw.endFile(ent); continue; }
-      zipCurFile.textContent = e.p.split('/').pop();
-      const ent = await zw.startFile(e.p, false);
-      let crc = 0xFFFFFFFF, failed = null;
-      for (let i = 0; i < e.segs.length; i++) {
-        fill();
-        let data = null;
-        try { data = await pending.shift(); } catch (err) { if (ctl.signal.aborted) throw err; failed = failed || err; }
-        fill();
-        if (failed || !data) continue;
-        crc = crcUpdate(crc, data); ent.size += data.length;
-        await sink(data); zw.off += data.length;
-        doneBytes += data.length;
-        const pct = total > 0 ? Math.min(99, Math.floor(doneBytes / total * 100)) : 0;
-        zipSetProgress(pct, doneFiles + ' / ' + files.length + ' files \u00b7 ' + _mb(doneBytes));
-      }
-      ent.crc = (crc ^ 0xFFFFFFFF) >>> 0;
-      if (failed) errors.push('Download fail: ' + e.p + ' (' + failed.message + ')');
-      await zw.endFile(ent); doneFiles++;
-    }
-    for (const m of tree.errors || []) errors.push(m);
-    if (errors.length) {
-      const ent = await zw.startFile('_errors.txt', false), data = new TextEncoder().encode(errors.join('\n'));
-      ent.size = data.length; ent.crc = (crcUpdate(0xFFFFFFFF, data) ^ 0xFFFFFFFF) >>> 0;
-      await sink(data); zw.off += data.length; await zw.endFile(ent);
-    }
-    await zw.finish();
-    await finishOut();
-  } catch (err) { ctl.abort(); if (ctl.abortOut) ctl.abortOut(); throw err; }
-  zipSetProgress(100, files.length + ' files \u00b7 ' + _mb(doneBytes), '\u2705 Ho gaya! Browser ke Downloads check karo');
-  _zipJobId = null; setTimeout(zipPanelHide, 3500);
-  return true;
-}
-
-function zipDl(ids) {
-  clearTimeout(_zipPollTimer);
-  const jobId = 'c' + Math.random().toString(16).slice(2);
-  _zipJobId = jobId;
-  const one = ids.length === 1 && byId(ids[0]);
-  const d = new Date(), p2 = (n) => String(n).padStart(2, '0');
-  const zname = (one && one.mimeType === FOLDER ? one.name.replace(/[\\/:*?"<>|]/g, '_') : 'Drive_files_' + d.getFullYear() + p2(d.getMonth() + 1) + p2(d.getDate()) + '_' + p2(d.getHours()) + p2(d.getMinutes())) + '.zip';
-  zipName.textContent = zname;
-  zipSetProgress(0, '', 'Files ki list ban rahi hai\u2026');
-  zipPanelShow();
-  const ctl = new AbortController();
-  $('#zipPanelClose').onclick = () => { _zipJobId = null; ctl.abort(); if (ctl.abortOut) ctl.abortOut(); clearTimeout(_zipPollTimer); zipPanelHide(); };
-  czipRun(ids, zname, jobId, ctl).then((ok) => { if (!ok && _zipJobId === jobId) zipDlServer(ids); })
-    .catch((e) => { if (_zipJobId === jobId) _zipFail(e.message || 'ZIP fail ho gayi'); });
+    const r = await fetch('/api/tree', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }), cache: 'no-store' });
+    t = await r.json();
+    if (!r.ok) throw new Error(t.error || 'List nahi ban saki');
+  } catch (e) { return toast(e.message || 'List nahi ban saki', true); }
+  const files = t.entries.filter((e) => !e.d);
+  if (!files.length) return toast('Download karne ke liye koi file nahi mili', true);
+  if (files.length > 30) {
+    const ok = await ask({ title: files.length + ' files download karein?', text: 'Har file alag se seedha Drive se download hogi. Browser multiple downloads ki permission maang sakta hai.', ok: 'Download' });
+    if (!ok) return;
+  }
+  toast(files.length + ' files download shuru ho rahi hain\u2026');
+  for (const f of files) {
+    const base = 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(f.id);
+    _go(f.x ? base + '/export?mimeType=' + encodeURIComponent(f.x) + '&access_token=' + encodeURIComponent(t.token)
+            : base + '?alt=media&supportsAllDrives=true&access_token=' + encodeURIComponent(t.token));
+    await new Promise((r) => setTimeout(r, 800));
+  }
+  if (t.errors && t.errors.length) toast(t.errors.length + ' item skip hue (unsupported)', true);
 }
 
 function openFile(f) {
@@ -987,7 +813,10 @@ function openMenu(f, x, y) {
   const isF = f.mimeType === FOLDER;
   const rows = [
     [isF ? 'Open folder' : 'Open file', 'open', () => (isF ? openFolder(f.id, f.name) : openFile(f))],
-    [isF ? 'Download as ZIP' : 'Download', isF ? 'zip' : 'download', () => (isF ? zipDl([f.id]) : dl(f.id))],
+    ...(isF ? [
+      ['ZIP via Google Drive (fastest)', 'zip', () => { window.open('https://drive.google.com/drive/folders/' + encodeURIComponent(f.id), '_blank', 'noopener'); toast('Drive khul gaya: folder par right-click \u2192 Download dabao, Google khud ZIP banayega'); }],
+      ['Download files separately', 'download', () => zipDl([f.id])]
+    ] : [['Download', 'download', () => dl(f.id)]]),
     ['Rename', 'edit', () => renameFile(f)],
     ['Select', 'select', () => { state.selMode = true; toggleSel(f.id, true); }],
     ['Move to trash', 'trash', () => trashMany([f]), true]
