@@ -337,6 +337,7 @@ main{flex:1;overflow:auto;padding:20px 26px 120px;position:relative;overscroll-b
   <symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.7" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.7" fill="currentColor" stroke="none"/><circle cx="12" cy="19" r="1.7" fill="currentColor" stroke="none"/></symbol>
   <symbol id="i-selall" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3.5"/><path d="m8.5 12 2.5 2.5 5-5"/></symbol>
   <symbol id="i-select" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="m8.5 12 2.5 2.5 4.5-5"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
 </defs></svg>
 
 <header>
@@ -1010,6 +1011,25 @@ async function renameFile(f) {
   catch (err) { toast(err.message, true); }
 }
 
+/* ---------- Copy public folder link ---------- */
+async function copyFolderLink(f) {
+  const link = 'https://drive.google.com/drive/folders/' + encodeURIComponent(f.id) + '?usp=sharing';
+  try {
+    await navigator.clipboard.writeText(link);
+    toast('\uD83D\uDD17 Public link copy ho gaya!');
+  } catch (e) {
+    // Clipboard API kaam na kare to fallback
+    const inp = document.createElement('input');
+    inp.value = link;
+    inp.style.cssText = 'position:fixed;top:-999px;left:-999px;opacity:0';
+    document.body.appendChild(inp);
+    inp.select(); inp.setSelectionRange(0, 99999);
+    try { document.execCommand('copy'); toast('\uD83D\uDD17 Public link copy ho gaya!'); }
+    catch (e2) { toast('Link: ' + link); }
+    document.body.removeChild(inp);
+  }
+}
+
 /* ---------- Menu / bottom sheet ---------- */
 function closeMenu() { $('#menu').classList.remove('show'); $('#scrim').classList.remove('show'); }
 function openMenu(f, x, y) {
@@ -1019,7 +1039,8 @@ function openMenu(f, x, y) {
     ...(isF ? [
       ['Download as ZIP', 'zip', () => zipDl([f.id])],
       ['ZIP via Google Drive', 'zip', () => { window.open('https://drive.google.com/drive/folders/' + encodeURIComponent(f.id), '_blank', 'noopener'); toast('Drive khul gaya: folder par right-click \u2192 Download dabao, Google khud ZIP banayega'); }],
-      ['Download files separately', 'download', () => zipSeparate([f.id])]
+      ['Download files separately', 'download', () => zipSeparate([f.id])],
+      ['Copy public link', 'link', () => copyFolderLink(f)]
     ] : [['Download', 'download', () => dl(f.id)]]),
     ['Rename', 'edit', () => renameFile(f)],
     ['Select', 'select', () => { state.selMode = true; toggleSel(f.id, true); }],
