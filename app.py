@@ -19,7 +19,9 @@ import mimetypes
 import os
 import queue
 import re
+import threading
 import time
+import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
@@ -230,6 +232,22 @@ main{flex:1;overflow:auto;padding:20px 26px 120px;position:relative;overscroll-b
 .up-row.err .bar>i{background:var(--danger)}
 .up-row.err .up-top span{color:var(--danger)}
 
+/* ZIP progress panel */
+.zippanel{position:fixed;left:50%;bottom:calc(28px + env(safe-area-inset-bottom));transform:translateX(-50%);width:340px;max-width:calc(100vw - 32px);background:var(--surface);border:1px solid var(--line);border-radius:20px;box-shadow:0 12px 40px rgba(0,0,0,.28);z-index:45;display:none;overflow:hidden}
+.zippanel.show{display:block;animation:pop .25s}
+.zip-head{display:flex;align-items:center;gap:10px;padding:12px 14px 10px;background:linear-gradient(135deg,#4f6bff,#8a5cff);color:#fff}
+.zip-head svg{flex-shrink:0}
+.zip-head b{flex:1;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.zip-head button{color:#fff;opacity:.85;width:32px;height:32px;border-radius:50%;display:grid;place-items:center;flex-shrink:0}
+.zip-head button:hover{background:rgba(255,255,255,.2)}
+.zip-body{padding:14px 16px 16px}
+.zip-file{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:8px;min-height:16px}
+.zip-barwrap{height:8px;border-radius:99px;background:var(--line);overflow:hidden}
+.zip-fill{height:100%;width:0%;background:linear-gradient(90deg,#4f6bff,#8a5cff);border-radius:99px;transition:width .3s ease}
+.zip-foot{display:flex;justify-content:space-between;align-items:center;margin-top:8px}
+.zip-pct{font-weight:700;font-size:13px;color:var(--primary)}
+.zip-count{font-size:12px;color:var(--muted)}
+
 /* Modal */
 .modal-bg{position:fixed;inset:0;background:rgba(10,12,22,.5);backdrop-filter:blur(3px);display:none;align-items:center;justify-content:center;z-index:90;padding:16px}
 .modal-bg.show{display:flex}
@@ -400,6 +418,22 @@ main{flex:1;overflow:auto;padding:20px 26px 120px;position:relative;overscroll-b
 <div class="uploads" id="uploads">
   <div class="up-head"><span id="upTitle">Uploading</span><button id="upClose" title="Close" aria-label="Close"><svg class="i"><use href="#i-close"/></svg></button></div>
   <div class="up-list" id="upList"></div>
+</div>
+
+<div class="zippanel" id="zipPanel">
+  <div class="zip-head">
+    <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="20" height="20"><path d="M4 7l1.5-3h13L20 7v12a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1zM4 7h16M10 11h4"/></svg>
+    <b id="zipPanelName">ZIP ban rahi hai…</b>
+    <button id="zipPanelClose" title="Close" aria-label="Close"><svg class="i" width="16" height="16"><use href="#i-close"/></svg></button>
+  </div>
+  <div class="zip-body">
+    <div class="zip-file" id="zipCurFile">Preparing…</div>
+    <div class="zip-barwrap"><div class="zip-fill" id="zipFill"></div></div>
+    <div class="zip-foot">
+      <span class="zip-pct" id="zipPct">0%</span>
+      <span class="zip-count" id="zipCount"></span>
+    </div>
+  </div>
 </div>
 
 <div class="modal-bg" id="modalBg"><div class="modal">
@@ -632,13 +666,94 @@ function dl(id) {
   a.href = '/api/download/' + encodeURIComponent(id);
   document.body.appendChild(a); a.click(); a.remove();
 }
+/* ---------- ZIP Progress Panel ---------- */
+let _zipEs = null;
+const zipPanel   = $('#zipPanel');
+const zipFill    = $('#zipFill');
+const zipPct     = $('#zipPct');
+const zipCount   = $('#zipCount');
+const zipCurFile = $('#zipCurFile');
+const zipName    = $('#zipPanelName');
+
+function zipPanelShow() { zipPanel.classList.add('show'); }
+function zipPanelHide() { zipPanel.classList.remove('show'); }
+
+$('#zipPanelClose').onclick = () => {
+  if (_zipEs) { _zipEs.close(); _zipEs = null; }
+  zipPanelHide();
+};
+
+function zipSetProgress(done, total, fileName) {
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  zipFill.style.width = pct + '%';
+  zipPct.textContent = pct + '%';
+  zipCount.textContent = total > 0 ? done + ' / ' + total + ' files' : '';
+  if (fileName) zipCurFile.textContent = fileName;
+}
+
 function zipDl(ids) {
-  const f = document.createElement('form');
-  f.method = 'POST'; f.action = '/api/zip'; f.target = 'dlframe'; f.style.display = 'none';
-  const i = document.createElement('input');
-  i.type = 'hidden'; i.name = 'ids'; i.value = JSON.stringify(ids);
-  f.appendChild(i); document.body.appendChild(f); f.submit(); f.remove();
-  toast('ZIP ban rahi hai, download abhi shuru hoga…');
+  if (_zipEs) { _zipEs.close(); _zipEs = null; }
+
+  zipName.textContent = 'ZIP ban rahi hai…';
+  zipCurFile.textContent = 'Files fetch ho rahi hain…';
+  zipSetProgress(0, 0, null);
+  zipPanelShow();
+
+  fetch('/api/zip/prepare', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids }),
+  }).then((res) => {
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+
+    function pump() {
+      reader.read().then(({ done, value }) => {
+        if (done) return;
+        buf += dec.decode(value, { stream: true });
+        const parts = buf.split('\n\n');
+        buf = parts.pop();
+        parts.forEach((part) => {
+          const line = part.trim();
+          if (!line.startsWith('data:')) return;
+          let ev;
+          try { ev = JSON.parse(line.slice(5).trim()); } catch { return; }
+
+          if (ev.type === 'start') {
+            zipName.textContent = ev.name || 'download.zip';
+            zipSetProgress(0, ev.total, null);
+            zipCurFile.textContent = ev.total + ' files prepare ho rahi hain…';
+
+          } else if (ev.type === 'progress') {
+            zipSetProgress(ev.done, ev.total, ev.file);
+
+          } else if (ev.type === 'ready') {
+            zipFill.style.width = '100%';
+            zipPct.textContent = '100%';
+            zipCurFile.textContent = 'Download shuru ho rahi hai…';
+            setTimeout(() => {
+              const a = document.createElement('a');
+              a.href = '/api/zip/download/' + ev.token;
+              document.body.appendChild(a); a.click(); a.remove();
+              setTimeout(zipPanelHide, 2000);
+            }, 300);
+
+          } else if (ev.type === 'error') {
+            zipCurFile.textContent = '❌ ' + ev.message;
+            zipPct.textContent = 'Error';
+            zipFill.style.background = 'var(--danger)';
+            toast(ev.message, true);
+          }
+        });
+        pump();
+      }).catch(() => {});
+    }
+    pump();
+  }).catch((err) => {
+    zipCurFile.textContent = '❌ ' + err.message;
+    toast('ZIP fail ho gayi: ' + err.message, true);
+  });
 }
 function openFile(f) {
   window.open(f.webViewLink || ('https://drive.google.com/file/d/' + f.id + '/view'), '_blank', 'noopener');
@@ -888,6 +1003,18 @@ _creds = None
 _attempts = {}  # ip -> [count, first_ts]
 MAX_ATTEMPTS = 5
 BLOCK_SECONDS = 600
+
+# ZIP job store: token -> {data, name, ts}  (max 15 min ttl)
+_zip_jobs: dict = {}
+_zip_lock = threading.Lock()
+ZIP_TTL = 900  # seconds
+
+def _zip_cleanup():
+    now = time.time()
+    with _zip_lock:
+        dead = [k for k, v in _zip_jobs.items() if now - v["ts"] > ZIP_TTL]
+        for k in dead:
+            del _zip_jobs[k]
 
 
 def get_creds():
@@ -1305,32 +1432,121 @@ def zip_stream(svc, metas):
     yield sink.take()
 
 
-@app.post("/api/zip")
-def zip_download():
-    raw = request.form.get("ids")
-    if raw is None:
-        raw = (request.get_json(silent=True) or {}).get("ids")
+@app.post("/api/zip/prepare")
+def zip_prepare():
+    """
+    SSE stream — ZIP parallel mein banata hai aur progress events bhejta hai.
+    Events:
+      data: {"type":"start",  "total": N, "name": "...zip"}
+      data: {"type":"progress","done": K, "total": N, "file": "filename"}
+      data: {"type":"ready",  "token": "..."}
+      data: {"type":"error",  "message": "..."}
+    """
+    raw = (request.get_json(silent=True) or {}).get("ids")
+    if not raw:
+        raw = request.form.get("ids")
     ids = json.loads(raw) if isinstance(raw, str) else raw
     if not isinstance(ids, list) or not ids:
         return jsonify(error="Kuch select nahi hai"), 400
     ids = [safe_id(i) for i in ids[:5000]]
 
-    svc = drive()
-    metas = [
-        svc.files().get(fileId=i, fields="id,name,mimeType", supportsAllDrives=True).execute()
-        for i in ids
-    ]
-    if len(metas) == 1 and metas[0]["mimeType"] == FOLDER_MIME:
-        zname = clean_name(metas[0]["name"]) + ".zip"
-    else:
-        zname = "Drive_files_" + time.strftime("%Y%m%d_%H%M") + ".zip"
+    def generate():
+        def ev(obj):
+            return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
+        try:
+            svc = drive()
+            metas = [
+                svc.files().get(fileId=i, fields="id,name,mimeType", supportsAllDrives=True).execute()
+                for i in ids
+            ]
+            if len(metas) == 1 and metas[0]["mimeType"] == FOLDER_MIME:
+                zname = clean_name(metas[0]["name"]) + ".zip"
+            else:
+                zname = "Drive_files_" + time.strftime("%Y%m%d_%H%M") + ".zip"
+
+            errors = []
+            all_entries = list(walk(svc, metas, errors))
+            file_entries = [(p, m) for p, m in all_entries if m is not None]
+            total = len(file_entries)
+
+            yield ev({"type": "start", "total": total, "name": zname})
+
+            # Parallel download with progress
+            results = {}
+            done_count = 0
+            with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
+                future_map = {
+                    pool.submit(_download_full, path, m, errors): (path, m)
+                    for path, m in file_entries
+                }
+                for fut in as_completed(future_map):
+                    path, data, err = fut.result()
+                    orig_path, orig_m = future_map[fut]
+                    if err:
+                        errors.append(f"Download fail: {path} ({err})")
+                        results[path] = b""
+                    else:
+                        results[path] = data
+                    done_count += 1
+                    yield ev({
+                        "type": "progress",
+                        "done": done_count,
+                        "total": total,
+                        "file": orig_m.get("name", path),
+                    })
+
+            # Build ZIP in memory
+            buf = io.BytesIO()
+            now_t = time.localtime()[:6]
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
+                for path, m in all_entries:
+                    info = zipfile.ZipInfo(path, now_t)
+                    info.compress_type = zipfile.ZIP_STORED
+                    if m is None:
+                        info.external_attr = (0o40775 << 16) | 0x10
+                        zf.writestr(info, b"")
+                        continue
+                    info.external_attr = 0o100644 << 16
+                    zf.writestr(info, results.get(path, b""))
+                if errors:
+                    zf.writestr("_errors.txt", "\n".join(errors))
+
+            token = uuid.uuid4().hex
+            _zip_cleanup()
+            with _zip_lock:
+                _zip_jobs[token] = {
+                    "data": buf.getvalue(),
+                    "name": zname,
+                    "ts": time.time(),
+                }
+            yield ev({"type": "ready", "token": token})
+
+        except Exception as e:  # noqa: BLE001
+            yield ev({"type": "error", "message": str(e)})
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/zip/download/<token>")
+def zip_serve(token):
+    """Taiyaar ZIP token se serve karo (ek baar)."""
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        return jsonify(error="Invalid token"), 400
+    with _zip_lock:
+        job = _zip_jobs.pop(token, None)
+    if not job:
+        return jsonify(error="ZIP expire ho gayi ya mili nahi"), 404
     headers = {
-        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(zname)}",
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(job['name'])}",
+        "Content-Length": str(len(job["data"])),
         "Cache-Control": "no-store",
-        "X-Accel-Buffering": "no",
     }
-    return Response(zip_stream(svc, metas), mimetype="application/zip", headers=headers)
+    return Response(job["data"], mimetype="application/zip", headers=headers)
 
 
 # ---------------------------------------------------------------- folder / rename / trash
