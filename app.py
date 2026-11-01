@@ -9,7 +9,7 @@ Features:
   - Android + desktop dono ke liye native-style UI, light / dark theme
 
 Local chalane ke liye:   python app.py
-Render start command:    gunicorn app:app --timeout 300 --workers 1 --threads 8
+Render start command:    gunicorn app:app --timeout 300 --workers 1 --threads 16
 """
 import hashlib
 import hmac
@@ -17,9 +17,11 @@ import io
 import json
 import mimetypes
 import os
+import queue
 import re
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 from urllib.parse import quote
 
@@ -1085,6 +1087,10 @@ def upload():
 
 
 # ---------------------------------------------------------------- download
+PARALLEL_WORKERS = 8          # Drive se ek saath kitni files download hon
+CHUNK_SIZE      = 8 * 1024 * 1024   # 8 MB chunks — badi files ke liye fast
+
+
 def iter_file(svc, file_id, mime):
     """File ke bytes chunk-by-chunk yield karta hai (Google Docs ko export karke)."""
     if mime in EXPORTS:
@@ -1092,7 +1098,7 @@ def iter_file(svc, file_id, mime):
     else:
         req = svc.files().get_media(fileId=file_id, supportsAllDrives=True)
     buf = io.BytesIO()
-    dl = MediaIoBaseDownload(buf, req, chunksize=4 * 1024 * 1024)
+    dl = MediaIoBaseDownload(buf, req, chunksize=CHUNK_SIZE)
     done = False
     while not done:
         _, done = dl.next_chunk()
@@ -1100,6 +1106,25 @@ def iter_file(svc, file_id, mime):
         buf.seek(0)
         buf.truncate(0)
         yield data
+
+
+def _download_full(path, m, errors):
+    """Ek file ka poora data memory mein download karo (worker thread mein chalta hai)."""
+    try:
+        svc = drive()   # har thread ka apna service object (thread-safe)
+        buf = io.BytesIO()
+        mime = m["mimeType"]
+        if mime in EXPORTS:
+            req = svc.files().export_media(fileId=m["id"], mimeType=EXPORTS[mime][0])
+        else:
+            req = svc.files().get_media(fileId=m["id"], supportsAllDrives=True)
+        dl = MediaIoBaseDownload(buf, req, chunksize=CHUNK_SIZE)
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        return path, buf.getvalue(), None
+    except Exception as e:  # noqa: BLE001
+        return path, None, str(e)
 
 
 @app.get("/api/download/<file_id>")
@@ -1215,31 +1240,65 @@ def walk(svc, metas, errors):
 
 
 def zip_stream(svc, metas):
-    sink = ZipSink()
-    zf = zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED, allowZip64=True)
+    """
+    Parallel ZIP streaming:
+    - Saari files ki list pehle bana lo (walk)
+    - PARALLEL_WORKERS threads se ek saath Drive se download karo
+    - ZIP mein order maintain karte hue stream karo user ko
+    """
     errors = []
     now = time.localtime()[:6]
-    for path, m in walk(svc, metas, errors):
+
+    # Step 1: poori file list build karo (folder structure ke saath)
+    all_entries = list(walk(svc, metas, errors))
+
+    # Step 2: sirf actual files (folders nahi) parallel download karo
+    file_entries  = [(p, m) for p, m in all_entries if m is not None]
+    folder_entries = {p for p, m in all_entries if m is None}
+
+    # Future -> original path mapping (order ke liye)
+    results = {}   # path -> bytes
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
+        future_map = {
+            pool.submit(_download_full, path, m, errors): path
+            for path, m in file_entries
+        }
+        for fut in as_completed(future_map):
+            path, data, err = fut.result()
+            if err:
+                errors.append(f"Download fail: {path} ({err})")
+                results[path] = b""
+            else:
+                results[path] = data
+
+    # Step 3: original order mein ZIP banao aur stream karo
+    sink = ZipSink()
+    zf = zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED, allowZip64=True)
+
+    for path, m in all_entries:
         info = zipfile.ZipInfo(path, now)
         info.compress_type = zipfile.ZIP_STORED
-        if m is None:  # empty folder entry
+
+        if m is None:  # folder entry
             info.external_attr = (0o40775 << 16) | 0x10
             zf.writestr(info, b"")
             yield sink.take()
             continue
+
         info.external_attr = 0o100644 << 16
-        try:
-            with zf.open(info, "w", force_zip64=True) as dest:
-                for chunk in iter_file(svc, m["id"], m["mimeType"]):
-                    dest.write(chunk)
-                    data = sink.take()
-                    if data:
-                        yield data
-        except Exception as e:  # noqa: BLE001
-            errors.append(f"Download fail: {path} ({e})")
-        data = sink.take()
-        if data:
-            yield data
+        data = results.get(path, b"")
+        # Bade files ko chunks mein likho taaki memory na bhar jaaye
+        WRITE_CHUNK = 4 * 1024 * 1024
+        with zf.open(info, "w", force_zip64=True) as dest:
+            for i in range(0, max(len(data), 1), WRITE_CHUNK):
+                dest.write(data[i : i + WRITE_CHUNK])
+                chunk = sink.take()
+                if chunk:
+                    yield chunk
+        chunk = sink.take()
+        if chunk:
+            yield chunk
+
     if errors:
         zf.writestr("_errors.txt", "\n".join(errors))
     zf.close()
