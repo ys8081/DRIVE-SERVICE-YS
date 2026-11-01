@@ -17,13 +17,13 @@ import io
 import json
 import mimetypes
 import os
-import queue
 import re
 import threading
 import time
 import uuid
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from urllib.parse import quote
 
@@ -666,7 +666,7 @@ function dl(id) {
   a.href = '/api/download/' + encodeURIComponent(id);
   document.body.appendChild(a); a.click(); a.remove();
 }
-/* ---------- ZIP Progress Panel ---------- */
+/* ---------- ZIP (direct streaming + live progress) ---------- */
 let _zipPollTimer = null;
 let _zipJobId = null;
 const zipPanel   = $('#zipPanel');
@@ -678,6 +678,7 @@ const zipName    = $('#zipPanelName');
 
 function zipPanelShow() { zipPanel.classList.add('show'); }
 function zipPanelHide() { zipPanel.classList.remove('show'); }
+function _mb(n) { return n >= 1073741824 ? (n / 1073741824).toFixed(2) + ' GB' : (n / 1048576).toFixed(1) + ' MB'; }
 
 $('#zipPanelClose').onclick = () => {
   clearTimeout(_zipPollTimer);
@@ -685,76 +686,76 @@ $('#zipPanelClose').onclick = () => {
   zipPanelHide();
 };
 
-function zipSetProgress(done, total, fileName) {
-  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+function zipSetProgress(pct, count, text) {
   zipFill.style.width = pct + '%';
   zipFill.style.background = '';
   zipPct.textContent = pct + '%';
-  zipCount.textContent = total > 0 ? done + ' / ' + total + ' files' : '';
-  if (fileName) zipCurFile.textContent = fileName;
+  zipCount.textContent = count || '';
+  if (text) zipCurFile.textContent = text;
 }
 
-function _pollZip(jobId) {
-  if (_zipJobId !== jobId) return; // cancelled
+function _zipFail(msg) {
+  clearTimeout(_zipPollTimer);
+  _zipJobId = null;
+  zipCurFile.textContent = '\u274c ' + msg;
+  zipPct.textContent = 'Error';
+  zipFill.style.background = 'var(--danger)';
+  toast(msg, true);
+}
+
+function _pollZip(jobId, misses) {
+  if (_zipJobId !== jobId) return;
   fetch('/api/zip/status/' + jobId)
-    .then((r) => r.json())
+    .then((r) => r.json().catch(() => ({ status: 'missing' })))
     .then((s) => {
       if (_zipJobId !== jobId) return;
-
-      if (s.status === 'working') {
-        zipName.textContent = s.name || 'ZIP ban rahi hai…';
-        zipSetProgress(s.done, s.total, s.cur_file || null);
-        _zipPollTimer = setTimeout(() => _pollZip(jobId), 600);
-
-      } else if (s.status === 'ready') {
-        zipSetProgress(s.total, s.total, 'Download shuru ho rahi hai…');
-        zipName.textContent = s.name || 'download.zip';
-        _zipJobId = null;
-        setTimeout(() => {
-          const a = document.createElement('a');
-          a.href = '/api/zip/download/' + jobId;
-          document.body.appendChild(a); a.click(); a.remove();
-          setTimeout(zipPanelHide, 2500);
-        }, 200);
-
-      } else if (s.status === 'error') {
-        zipCurFile.textContent = '❌ ' + (s.error || 'Kuch gadbad ho gayi');
-        zipPct.textContent = 'Error';
-        zipFill.style.background = 'var(--danger)';
-        toast(s.error || 'ZIP fail ho gayi', true);
-        _zipJobId = null;
+      if (s.status === 'missing') {
+        if (misses > 25) return _zipFail('ZIP shuru nahi hui. Page refresh karke dobara try karo.');
+        _zipPollTimer = setTimeout(() => _pollZip(jobId, misses + 1), 500);
+        return;
       }
+      if (s.name) zipName.textContent = s.name;
+      if (s.status === 'preparing') {
+        zipSetProgress(0, '', 'Files ki list ban rahi hai\u2026');
+      } else if (s.status === 'working') {
+        const pct = s.total_bytes > 0 ? Math.min(99, Math.floor((s.bytes / s.total_bytes) * 100))
+                  : (s.total ? Math.floor((s.done / s.total) * 100) : 0);
+        zipSetProgress(pct, s.done + ' / ' + s.total + ' files \u00b7 ' + _mb(s.bytes), s.cur_file || 'Download ho rahi hai\u2026');
+      } else if (s.status === 'done') {
+        zipSetProgress(100, s.total + ' files \u00b7 ' + _mb(s.bytes), '\u2705 Ho gaya! Browser ke Downloads check karo');
+        _zipJobId = null;
+        setTimeout(zipPanelHide, 3500);
+        return;
+      } else if (s.status === 'error') {
+        return _zipFail(s.error || 'ZIP fail ho gayi');
+      } else if (s.status === 'cancelled') {
+        _zipJobId = null; zipPanelHide(); return;
+      }
+      _zipPollTimer = setTimeout(() => _pollZip(jobId, 0), 500);
     })
-    .catch(() => {
-      if (_zipJobId !== jobId) return;
-      _zipPollTimer = setTimeout(() => _pollZip(jobId), 1500);
-    });
+    .catch(() => { _zipPollTimer = setTimeout(() => _pollZip(jobId, misses + 1), 1000); });
 }
 
 function zipDl(ids) {
   clearTimeout(_zipPollTimer);
-  _zipJobId = null;
+  const rnd = crypto.getRandomValues(new Uint8Array(16));
+  const jobId = Array.from(rnd).map((b) => b.toString(16).padStart(2, '0')).join('');
+  _zipJobId = jobId;
 
-  zipName.textContent = 'ZIP ban rahi hai…';
-  zipCurFile.textContent = 'Shuru ho rahi hai…';
-  zipSetProgress(0, 0, null);
+  zipName.textContent = 'ZIP ban rahi hai\u2026';
+  zipSetProgress(0, '', 'Shuru ho rahi hai\u2026');
   zipPanelShow();
 
-  fetch('/api/zip/prepare', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ids }),
-  })
-    .then((r) => r.json())
-    .then((d) => {
-      if (!d.job_id) { toast(d.error || 'ZIP shuru nahi hui', true); zipPanelHide(); return; }
-      _zipJobId = d.job_id;
-      _pollZip(d.job_id);
-    })
-    .catch((err) => {
-      zipCurFile.textContent = '❌ ' + err.message;
-      toast('ZIP fail: ' + err.message, true);
-    });
+  // Direct streaming download: browser ko turant file milti hai (koi blob/RAM nahi)
+  const f = document.createElement('form');
+  f.method = 'POST'; f.action = '/api/zip'; f.target = 'dlframe'; f.style.display = 'none';
+  [['ids', JSON.stringify(ids)], ['job', jobId]].forEach(([k, v]) => {
+    const i = document.createElement('input');
+    i.type = 'hidden'; i.name = k; i.value = v; f.appendChild(i);
+  });
+  document.body.appendChild(f); f.submit(); f.remove();
+
+  _pollZip(jobId, 0);
 }
 function openFile(f) {
   window.open(f.webViewLink || ('https://drive.google.com/file/d/' + f.id + '/view'), '_blank', 'noopener');
@@ -1008,7 +1009,7 @@ BLOCK_SECONDS = 600
 # ZIP job store: token -> {data, name, ts}  (max 15 min ttl)
 _zip_jobs: dict = {}
 _zip_lock = threading.Lock()
-ZIP_TTL = 900  # seconds
+ZIP_TTL = 900  # seconds (last activity ke baad)
 
 def _zip_cleanup():
     now = time.time()
@@ -1018,27 +1019,31 @@ def _zip_cleanup():
             del _zip_jobs[k]
 
 
+_creds_lock = threading.Lock()
+
+
 def get_creds():
     global _creds
-    if _creds is None:
-        raw = os.environ.get("GOOGLE_TOKEN_JSON")
-        if raw:
-            info = json.loads(raw)
-        elif os.path.exists(TOKEN_FILE):
-            with open(TOKEN_FILE, encoding="utf-8") as f:
-                info = json.load(f)
-        else:
-            raise RuntimeError(
-                "Token nahi mila. token.json isi folder mein rakho "
-                "ya GOOGLE_TOKEN_JSON env variable set karo."
-            )
-        _creds = Credentials.from_authorized_user_info(info, SCOPES)
-    if not _creds.valid:
-        _creds.refresh(Request())
-        if not os.environ.get("GOOGLE_TOKEN_JSON") and os.path.exists(TOKEN_FILE):
-            with open(TOKEN_FILE, "w", encoding="utf-8") as f:
-                f.write(_creds.to_json())
-    return _creds
+    with _creds_lock:  # 8 download threads ek saath refresh na karein
+        if _creds is None:
+            raw = os.environ.get("GOOGLE_TOKEN_JSON")
+            if raw:
+                info = json.loads(raw)
+            elif os.path.exists(TOKEN_FILE):
+                with open(TOKEN_FILE, encoding="utf-8") as f:
+                    info = json.load(f)
+            else:
+                raise RuntimeError(
+                    "Token nahi mila. token.json isi folder mein rakho "
+                    "ya GOOGLE_TOKEN_JSON env variable set karo."
+                )
+            _creds = Credentials.from_authorized_user_info(info, SCOPES)
+        if not _creds.valid:
+            _creds.refresh(Request())
+            if not os.environ.get("GOOGLE_TOKEN_JSON") and os.path.exists(TOKEN_FILE):
+                with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+                    f.write(_creds.to_json())
+        return _creds
 
 
 def drive():
@@ -1215,51 +1220,126 @@ def upload():
 
 
 # ---------------------------------------------------------------- download
-PARALLEL_WORKERS = 8          # Drive se ek saath kitni files download hon
-CHUNK_SIZE      = 8 * 1024 * 1024   # 8 MB chunks — badi files ke liye fast
+# Fast + low-memory design:
+#   * Har file 8MB ke "segments" (HTTP Range requests) mein tooti hai
+#   * FETCH_THREADS segments EK SAATH Drive se aate hain (badi single file bhi parallel)
+#   * Sirf WINDOW segments memory mein rehte hain  ->  RAM bounded (~80MB), 512MB mein safe
+SEG_SIZE = 8 * 1024 * 1024
+FETCH_THREADS = 8
+WINDOW = 10
+_tls = threading.local()
+
+
+def _thread_drive():
+    """Har worker thread ka apna Drive service (httplib2 thread-safe nahi hota)."""
+    svc = getattr(_tls, "svc", None)
+    if svc is None:
+        svc = drive()
+        _tls.svc = svc
+    return svc
+
+
+_RETRY_REASONS = ("ratelimitexceeded", "userratelimitexceeded", "backenderror", "internalerror")
+
+
+def _retryable(e):
+    st = e.resp.status
+    if st in (408, 429, 500, 502, 503, 504):
+        return True
+    if st == 403:
+        try:
+            return any(r in e.content.decode("utf-8", "ignore").lower() for r in _RETRY_REASONS)
+        except Exception:  # noqa: BLE001
+            return False
+    return False
+
+
+def _fetch_seg(file_id, mime, start, end):
+    """Ek segment download karo (retry + length check ke saath)."""
+    last = None
+    for attempt in range(5):
+        try:
+            svc = _thread_drive()
+            if mime in EXPORTS:
+                data = svc.files().export_media(
+                    fileId=file_id, mimeType=EXPORTS[mime][0]
+                ).execute()
+            else:
+                req = svc.files().get_media(fileId=file_id, supportsAllDrives=True)
+                req.headers["Range"] = f"bytes={start}-{end}"
+                data = req.execute()
+                want = end - start + 1
+                if len(data) != want:
+                    raise IOError(f"short read {len(data)}/{want}")
+            return data
+        except HttpError as e:
+            last = e
+            if not _retryable(e):
+                raise
+            _tls.svc = None
+        except Exception as e:  # noqa: BLE001
+            last = e
+            _tls.svc = None  # naya connection
+        time.sleep(min(2 ** attempt, 8) * 0.4)
+    raise last
+
+
+def _segments(m):
+    """File ke (start, end) byte ranges. Google Docs export = ek hi segment."""
+    if m["mimeType"] in EXPORTS:
+        return [(0, 0)]
+    size = int(m.get("size") or 0)
+    if size <= 0:
+        return []
+    return [(x, min(x + SEG_SIZE, size) - 1) for x in range(0, size, SEG_SIZE)]
+
+
+def fetch_ordered(pool, tasks):
+    """tasks ke (data, error) ORDER mein yield karta hai; WINDOW tak parallel prefetch."""
+    it = iter(tasks)
+    pending = deque()
+    try:
+        while True:
+            while len(pending) < WINDOW:
+                t = next(it, None)
+                if t is None:
+                    break
+                pending.append(pool.submit(_fetch_seg, *t))
+            if not pending:
+                return
+            fut = pending.popleft()
+            try:
+                yield fut.result(), None
+            except Exception as e:  # noqa: BLE001
+                yield None, e
+    finally:
+        for f in pending:
+            f.cancel()
 
 
 def iter_file(svc, file_id, mime):
-    """File ke bytes chunk-by-chunk yield karta hai (Google Docs ko export karke)."""
+    """(Purana helper) sequential chunks - ab sirf fallback ke liye."""
     if mime in EXPORTS:
         req = svc.files().export_media(fileId=file_id, mimeType=EXPORTS[mime][0])
     else:
         req = svc.files().get_media(fileId=file_id, supportsAllDrives=True)
     buf = io.BytesIO()
-    dl = MediaIoBaseDownload(buf, req, chunksize=CHUNK_SIZE)
+    dl = MediaIoBaseDownload(buf, req, chunksize=4 * 1024 * 1024)
     done = False
     while not done:
         _, done = dl.next_chunk()
         data = buf.getvalue()
         buf.seek(0)
         buf.truncate(0)
-        yield data
-
-
-def _download_full(path, m, errors):
-    """Ek file ka poora data memory mein download karo (worker thread mein chalta hai)."""
-    try:
-        svc = drive()   # har thread ka apna service object (thread-safe)
-        buf = io.BytesIO()
-        mime = m["mimeType"]
-        if mime in EXPORTS:
-            req = svc.files().export_media(fileId=m["id"], mimeType=EXPORTS[mime][0])
-        else:
-            req = svc.files().get_media(fileId=m["id"], supportsAllDrives=True)
-        dl = MediaIoBaseDownload(buf, req, chunksize=CHUNK_SIZE)
-        done = False
-        while not done:
-            _, done = dl.next_chunk()
-        return path, buf.getvalue(), None
-    except Exception as e:  # noqa: BLE001
-        return path, None, str(e)
+        if data:
+            yield data
 
 
 @app.get("/api/download/<file_id>")
 def download(file_id):
     file_id = safe_id(file_id)
     svc = drive()
-    meta = svc.files().get(fileId=file_id, fields="name,mimeType,size", supportsAllDrives=True).execute()
+    meta = svc.files().get(fileId=file_id, fields="id,name,mimeType,size", supportsAllDrives=True).execute()
     name, mime = meta["name"], meta["mimeType"]
 
     if mime == FOLDER_MIME:
@@ -1274,17 +1354,29 @@ def download(file_id):
     else:
         size = meta.get("size")
 
-    gen = iter_file(svc, file_id, mime)
-    first = next(gen, b"")  # error ho to response shuru hone se pehle pakad lo
+    tasks = [(file_id, mime, st, en) for st, en in _segments(meta)]
+    pool = ThreadPoolExecutor(max_workers=FETCH_THREADS)
 
     def stream():
+        try:
+            for data, err in fetch_ordered(pool, tasks):
+                if err:
+                    raise err
+                yield data
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    gen = stream()
+    first = next(gen, b"")  # error ho to response shuru hone se pehle pakad lo
+
+    def out():
         yield first
         yield from gen
 
-    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}"}
+    headers = {"Content-Disposition": f"attachment; filename*=UTF-8\'\'{quote(name)}"}
     if size:
         headers["Content-Length"] = size
-    return Response(stream(), mimetype=out_mime, headers=headers)
+    return Response(out(), mimetype=out_mime, headers=headers)
 
 
 # ---------------------------------------------------------------- ZIP (multi-select / folder)
@@ -1321,7 +1413,7 @@ def list_children(svc, folder_id):
                 q=f"'{folder_id}' in parents and trashed = false",
                 pageSize=1000,
                 pageToken=token,
-                fields="nextPageToken,files(id,name,mimeType)",
+                fields="nextPageToken,files(id,name,mimeType,size)",
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
             )
@@ -1367,213 +1459,150 @@ def walk(svc, metas, errors):
     yield from rec(metas, "")
 
 
-def zip_stream(svc, metas):
+def zip_stream(entries, errors, job):
     """
-    Parallel ZIP streaming:
-    - Saari files ki list pehle bana lo (walk)
-    - PARALLEL_WORKERS threads se ek saath Drive se download karo
-    - ZIP mein order maintain karte hue stream karo user ko
+    ZIP seedha user ko stream hoti hai (Drive jaisa): koi "prepare" wait nahi,
+    RAM mein poori ZIP kabhi nahi banti. Files/segments parallel fetch hote hain.
     """
-    errors = []
-    now = time.localtime()[:6]
-
-    # Step 1: poori file list build karo (folder structure ke saath)
-    all_entries = list(walk(svc, metas, errors))
-
-    # Step 2: sirf actual files (folders nahi) parallel download karo
-    file_entries  = [(p, m) for p, m in all_entries if m is not None]
-    folder_entries = {p for p, m in all_entries if m is None}
-
-    # Future -> original path mapping (order ke liye)
-    results = {}   # path -> bytes
-    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
-        future_map = {
-            pool.submit(_download_full, path, m, errors): path
-            for path, m in file_entries
-        }
-        for fut in as_completed(future_map):
-            path, data, err = fut.result()
-            if err:
-                errors.append(f"Download fail: {path} ({err})")
-                results[path] = b""
-            else:
-                results[path] = data
-
-    # Step 3: original order mein ZIP banao aur stream karo
+    pool = ThreadPoolExecutor(max_workers=FETCH_THREADS)
     sink = ZipSink()
     zf = zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED, allowZip64=True)
+    now = time.localtime()[:6]
 
-    for path, m in all_entries:
-        info = zipfile.ZipInfo(path, now)
-        info.compress_type = zipfile.ZIP_STORED
-
-        if m is None:  # folder entry
-            info.external_attr = (0o40775 << 16) | 0x10
-            zf.writestr(info, b"")
-            yield sink.take()
+    plan, tasks = [], []
+    for path, m in entries:
+        if m is None:
+            plan.append((path, None, 0))
             continue
+        segs = _segments(m)
+        plan.append((path, m, len(segs)))
+        for st, en in segs:
+            tasks.append((m["id"], m["mimeType"], st, en))
 
-        info.external_attr = 0o100644 << 16
-        data = results.get(path, b"")
-        # Bade files ko chunks mein likho taaki memory na bhar jaaye
-        WRITE_CHUNK = 4 * 1024 * 1024
-        with zf.open(info, "w", force_zip64=True) as dest:
-            for i in range(0, max(len(data), 1), WRITE_CHUNK):
-                dest.write(data[i : i + WRITE_CHUNK])
-                chunk = sink.take()
-                if chunk:
-                    yield chunk
-        chunk = sink.take()
-        if chunk:
-            yield chunk
-
-    if errors:
-        zf.writestr("_errors.txt", "\n".join(errors))
-    zf.close()
-    yield sink.take()
-
-
-def _build_zip_job(job_id, ids):
-    """Background thread mein ZIP banao — polling ke liye job store update karte raho."""
-    job = _zip_jobs[job_id]
+    stream = fetch_ordered(pool, tasks)
     try:
-        svc = drive()
-        metas = [
-            svc.files().get(fileId=i, fields="id,name,mimeType", supportsAllDrives=True).execute()
-            for i in ids
-        ]
-        if len(metas) == 1 and metas[0]["mimeType"] == FOLDER_MIME:
-            zname = clean_name(metas[0]["name"]) + ".zip"
-        else:
-            zname = "Drive_files_" + time.strftime("%Y%m%d_%H%M") + ".zip"
+        for path, m, nseg in plan:
+            info = zipfile.ZipInfo(path, now)
+            info.compress_type = zipfile.ZIP_STORED
+            if m is None:  # folder entry
+                info.external_attr = (0o40775 << 16) | 0x10
+                zf.writestr(info, b"")
+                out = sink.take()
+                if out:
+                    yield out
+                continue
 
-        with _zip_lock:
-            job["name"] = zname
-
-        errors = []
-        all_entries = list(walk(svc, metas, errors))
-        file_entries = [(p, m) for p, m in all_entries if m is not None]
-        total = len(file_entries)
-
-        with _zip_lock:
-            job["total"] = total
-            job["done"] = 0
-            job["cur_file"] = ""
-
-        results = {}
-        with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
-            future_map = {
-                pool.submit(_download_full, path, m, errors): (path, m)
-                for path, m in file_entries
-            }
-            for fut in as_completed(future_map):
-                path, data, err = fut.result()
-                orig_path, orig_m = future_map[fut]
-                results[orig_path] = data if not err else b""
-                if err:
-                    errors.append(f"Download fail: {path} ({err})")
-                with _zip_lock:
-                    job["done"] += 1
-                    job["cur_file"] = orig_m.get("name", path)
-
-        # Build ZIP
-        buf = io.BytesIO()
-        now_t = time.localtime()[:6]
-        with _zip_lock:
-            job["cur_file"] = "ZIP pack ho rahi hai…"
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
-            for path, m in all_entries:
-                info = zipfile.ZipInfo(path, now_t)
-                info.compress_type = zipfile.ZIP_STORED
-                if m is None:
-                    info.external_attr = (0o40775 << 16) | 0x10
-                    zf.writestr(info, b"")
-                    continue
-                info.external_attr = 0o100644 << 16
-                zf.writestr(info, results.get(path, b""))
-            if errors:
-                zf.writestr("_errors.txt", "\n".join(errors))
-
-        with _zip_lock:
-            job["data"] = buf.getvalue()
-            job["status"] = "ready"
+            info.external_attr = 0o100644 << 16
+            job["cur_file"] = m["name"]
+            failed = None
+            with zf.open(info, "w", force_zip64=True) as dest:
+                for _ in range(nseg):
+                    data, err = next(stream)
+                    if failed or err:
+                        failed = failed or err
+                        continue
+                    dest.write(data)
+                    job["bytes"] += len(data)
+                    job["ts"] = time.time()
+                    out = sink.take()
+                    if out:
+                        yield out
+            if failed:
+                errors.append(f"Download fail: {path} ({failed})")
+            job["done"] += 1
             job["ts"] = time.time()
+            out = sink.take()
+            if out:
+                yield out
 
-    except Exception as e:  # noqa: BLE001
-        with _zip_lock:
-            job["status"] = "error"
-            job["error"] = str(e)
+        if errors:
+            zf.writestr("_errors.txt", "\n".join(errors))
+        zf.close()
+        out = sink.take()
+        if out:
+            yield out
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
-@app.post("/api/zip/prepare")
-def zip_prepare():
-    """ZIP job shuru karo — job_id wapas karo polling ke liye."""
-    raw = (request.get_json(silent=True) or {}).get("ids")
-    if not raw:
-        raw = request.form.get("ids")
+@app.post("/api/zip")
+def zip_download():
+    raw = request.form.get("ids")
+    if raw is None:
+        raw = (request.get_json(silent=True) or {}).get("ids")
     ids = json.loads(raw) if isinstance(raw, str) else raw
     if not isinstance(ids, list) or not ids:
         return jsonify(error="Kuch select nahi hai"), 400
     ids = [safe_id(i) for i in ids[:5000]]
 
-    _zip_cleanup()
-    job_id = uuid.uuid4().hex
-    with _zip_lock:
-        _zip_jobs[job_id] = {
-            "status": "working",
-            "total": 0,
-            "done": 0,
-            "cur_file": "Shuru ho rahi hai…",
-            "name": "download.zip",
-            "data": None,
-            "ts": time.time(),
-        }
+    job_id = request.form.get("job") or ""
+    if not re.fullmatch(r"[0-9a-f]{32}", job_id):
+        job_id = uuid.uuid4().hex
 
-    t = threading.Thread(target=_build_zip_job, args=(job_id, ids), daemon=True)
-    t.start()
-    return jsonify(job_id=job_id)
+    svc = drive()
+    _zip_cleanup()
+    job = {
+        "status": "preparing", "name": "ZIP", "total": 0, "done": 0,
+        "bytes": 0, "total_bytes": 0, "cur_file": "", "error": "", "ts": time.time(),
+    }
+    with _zip_lock:
+        _zip_jobs[job_id] = job  # poll turant kaam kare, "missing" kabhi na aaye
+
+    def get_meta(i):
+        return _thread_drive().files().get(
+            fileId=i, fields="id,name,mimeType,size", supportsAllDrives=True
+        ).execute()
+
+    try:
+        with ThreadPoolExecutor(max_workers=min(8, len(ids))) as p:
+            metas = list(p.map(get_meta, ids))
+    except Exception as e:  # noqa: BLE001
+        job["status"] = "error"
+        job["error"] = str(e)
+        raise
+
+    if len(metas) == 1 and metas[0]["mimeType"] == FOLDER_MIME:
+        zname = clean_name(metas[0]["name"]) + ".zip"
+    else:
+        zname = "Drive_files_" + time.strftime("%Y%m%d_%H%M") + ".zip"
+    job["name"] = zname
+
+    def gen():
+        try:
+            errors = []
+            entries = list(walk(svc, metas, errors))
+            files = [m for _, m in entries if m is not None]
+            job["total"] = len(files)
+            job["total_bytes"] = sum(int(m.get("size") or 0) for m in files)
+            job["status"] = "working"
+            yield from zip_stream(entries, errors, job)
+            job["status"] = "done"
+        except GeneratorExit:
+            job["status"] = "cancelled"
+            raise
+        except Exception as e:  # noqa: BLE001
+            job["status"] = "error"
+            job["error"] = str(e)
+            raise
+
+    headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8\'\'{quote(zname)}",
+        "Cache-Control": "no-store",
+        "X-Accel-Buffering": "no",
+    }
+    return Response(gen(), mimetype="application/zip", headers=headers)
 
 
 @app.get("/api/zip/status/<job_id>")
 def zip_status(job_id):
-    """Job ka current status / progress return karo."""
     if not re.fullmatch(r"[0-9a-f]{32}", job_id):
         return jsonify(error="Invalid job_id"), 400
     with _zip_lock:
         job = _zip_jobs.get(job_id)
     if not job:
-        return jsonify(error="Job nahi mili"), 404
-    resp = {
-        "status":   job["status"],
-        "total":    job["total"],
-        "done":     job["done"],
-        "cur_file": job["cur_file"],
-        "name":     job["name"],
-    }
-    if job["status"] == "error":
-        resp["error"] = job.get("error", "Unknown error")
-    return jsonify(resp)
-
-
-@app.get("/api/zip/download/<job_id>")
-def zip_serve(job_id):
-    """Taiyaar ZIP serve karo aur job delete karo."""
-    if not re.fullmatch(r"[0-9a-f]{32}", job_id):
-        return jsonify(error="Invalid job_id"), 400
-    with _zip_lock:
-        job = _zip_jobs.get(job_id)
-    if not job or job["status"] != "ready":
-        return jsonify(error="ZIP taiyaar nahi hai ya mili nahi"), 404
-    data = job["data"]
-    name = job["name"]
-    with _zip_lock:
-        _zip_jobs.pop(job_id, None)
-    headers = {
-        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}",
-        "Content-Length": str(len(data)),
-        "Cache-Control": "no-store",
-    }
-    return Response(data, mimetype="application/zip", headers=headers)
+        return jsonify(status="missing"), 404
+    return jsonify({k: job[k] for k in
+                    ("status", "name", "total", "done", "bytes", "total_bytes", "cur_file", "error")})
 
 
 # ---------------------------------------------------------------- folder / rename / trash
