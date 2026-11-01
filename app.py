@@ -24,7 +24,7 @@ import uuid
 import zipfile
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import datetime, timedelta
 from urllib.parse import quote
 
 from flask import Flask, Response, jsonify, request, session
@@ -661,10 +661,19 @@ $('#search').addEventListener('input', (e) => {
 });
 
 /* ---------- File actions ---------- */
-function dl(id) {
+function _go(href) {
   const a = document.createElement('a');
-  a.href = '/api/download/' + encodeURIComponent(id);
+  a.href = href;
   document.body.appendChild(a); a.click(); a.remove();
+}
+async function dl(id) {
+  // Seedha Google se download (Render ka CPU beech mein nahi). Fail ho to purana server route.
+  try {
+    const r = await fetch('/api/direct/' + encodeURIComponent(id), { cache: 'no-store' });
+    const d = await r.json();
+    if (r.ok && d.url) return _go(d.url);
+  } catch (e) {}
+  _go('/api/download/' + encodeURIComponent(id));
 }
 /* ---------- ZIP (direct streaming + live progress) ---------- */
 let _zipPollTimer = null;
@@ -1333,6 +1342,38 @@ def iter_file(svc, file_id, mime):
         buf.truncate(0)
         if data:
             yield data
+
+
+@app.get("/api/direct/<file_id>")
+def direct_link(file_id):
+    """Browser ko Google ka seedha download URL do - data Render se hokar nahi guzarta."""
+    if os.environ.get("DIRECT_DL", "1") == "0":
+        return jsonify(error="direct off"), 404
+    file_id = safe_id(file_id)
+    meta = drive().files().get(
+        fileId=file_id, fields="id,name,mimeType", supportsAllDrives=True
+    ).execute()
+    mime = meta["mimeType"]
+    if mime == FOLDER_MIME:
+        return jsonify(error="Folder ke liye ZIP download use karo"), 400
+
+    creds = get_creds()
+    with _creds_lock:  # token kam se kam ~10 min chalna chahiye
+        exp = creds.expiry
+        if not creds.token or (exp and (exp - datetime.utcnow()).total_seconds() < 600):
+            creds.refresh(Request())
+        token = creds.token
+
+    base = "https://www.googleapis.com/drive/v3/files/" + quote(file_id, safe="")
+    if mime in EXPORTS:
+        url = f"{base}/export?mimeType={quote(EXPORTS[mime][0], safe='')}&access_token={quote(token, safe='')}"
+    elif mime.startswith("application/vnd.google-apps."):
+        return jsonify(error="Ye Google file type download nahi hota"), 400
+    else:
+        url = f"{base}?alt=media&supportsAllDrives=true&acknowledgeAbuse=false&access_token={quote(token, safe='')}"
+    resp = jsonify(url=url, name=meta["name"])
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.get("/api/download/<file_id>")
