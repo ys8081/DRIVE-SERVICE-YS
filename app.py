@@ -773,7 +773,7 @@ function zipDlServer(ids) {
   _pollZip(jobId, 0);
 }
 /* ---------- Folder / bahut saari files: har file seedha Google ke link se (ZIP nahi, Render nahi) ---------- */
-async function zipDl(ids) {
+async function zipSeparate(ids) {
   toast('Files ki list ban rahi hai\u2026');
   let t;
   try {
@@ -789,12 +789,215 @@ async function zipDl(ids) {
   }
   toast(files.length + ' files download shuru ho rahi hain\u2026');
   for (const f of files) {
+    if (f.u) { _go(f.u); await new Promise((r) => setTimeout(r, 800)); continue; }
     const base = 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(f.id);
     _go(f.x ? base + '/export?mimeType=' + encodeURIComponent(f.x) + '&access_token=' + encodeURIComponent(t.token)
             : base + '?alt=media&supportsAllDrives=true&access_token=' + encodeURIComponent(t.token));
     await new Promise((r) => setTimeout(r, 800));
   }
   if (t.errors && t.errors.length) toast(t.errors.length + ' item skip hue (unsupported)', true);
+}
+
+/* ---------- CLIENT ZIP: browser seedha Google se files leta hai, ZIP khud banata hai (Render bypass) ---------- */
+const CZ_SEG = 8 * 1024 * 1024, CZ_WINDOW = 12, CZ_BLOB_MAX = 2 * 1024 ** 3, CZ_ZIP_MAX = 3.9 * 1024 ** 3;
+const _CRC = (() => {
+  const T = new Uint32Array(256 * 8);
+  for (let i = 0; i < 256; i++) { let c = i; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; T[i] = c >>> 0; }
+  for (let k = 1; k < 8; k++) for (let i = 0; i < 256; i++) { const p = T[(k - 1) * 256 + i]; T[k * 256 + i] = ((p >>> 8) ^ T[p & 255]) >>> 0; }
+  return T;
+})();
+function crcUpdate(crc, u8) { // crc = raw running state (start 0xFFFFFFFF)
+  const T = _CRC; let i = 0; const n = u8.length;
+  for (; i + 8 <= n; i += 8) {
+    const a = (u8[i] | u8[i + 1] << 8 | u8[i + 2] << 16 | u8[i + 3] << 24) ^ crc;
+    const b = u8[i + 4] | u8[i + 5] << 8 | u8[i + 6] << 16 | u8[i + 7] << 24;
+    crc = T[1792 + (a & 255)] ^ T[1536 + ((a >>> 8) & 255)] ^ T[1280 + ((a >>> 16) & 255)] ^ T[1024 + (a >>> 24)] ^
+          T[768 + (b & 255)] ^ T[512 + ((b >>> 8) & 255)] ^ T[256 + ((b >>> 16) & 255)] ^ T[b >>> 24];
+  }
+  for (; i < n; i++) crc = T[(crc ^ u8[i]) & 255] ^ (crc >>> 8);
+  return crc >>> 0;
+}
+function _dosTime(d) {
+  return [((d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1)) & 0xFFFF,
+          (((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate()) & 0xFFFF];
+}
+class ZipWriter {
+  constructor(sink) { this.sink = sink; this.off = 0; this.cd = []; this.enc = new TextEncoder(); this.t = _dosTime(new Date()); }
+  async _w(u8) { await this.sink(u8); this.off += u8.length; }
+  async startFile(path, isDir) {
+    const name = this.enc.encode(path), h = new DataView(new ArrayBuffer(30));
+    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, isDir ? 0x0800 : 0x0808, true);
+    h.setUint16(8, 0, true); h.setUint16(10, this.t[0], true); h.setUint16(12, this.t[1], true);
+    h.setUint16(26, name.length, true);
+    const e = { name, isDir, off: this.off, crc: 0, size: 0, flags: isDir ? 0x0800 : 0x0808 };
+    this.cd.push(e);
+    await this._w(new Uint8Array(h.buffer)); await this._w(name);
+    return e;
+  }
+  async endFile(e) {
+    if (e.isDir) return;
+    const d = new DataView(new ArrayBuffer(16));
+    d.setUint32(0, 0x08074b50, true); d.setUint32(4, e.crc, true); d.setUint32(8, e.size, true); d.setUint32(12, e.size, true);
+    await this._w(new Uint8Array(d.buffer));
+  }
+  async finish() {
+    const start = this.off;
+    for (const e of this.cd) {
+      const c = new DataView(new ArrayBuffer(46));
+      c.setUint32(0, 0x02014b50, true); c.setUint16(4, 0x0314, true); c.setUint16(6, 20, true); c.setUint16(8, e.flags, true);
+      c.setUint16(12, this.t[0], true); c.setUint16(14, this.t[1], true);
+      c.setUint32(16, e.crc, true); c.setUint32(20, e.size, true); c.setUint32(24, e.size, true);
+      c.setUint16(28, e.name.length, true);
+      c.setUint32(38, e.isDir ? (((0o40775 << 16) | 0x10) >>> 0) : ((0o100644 << 16) >>> 0), true);
+      c.setUint32(42, e.off, true);
+      await this._w(new Uint8Array(c.buffer)); await this._w(e.name);
+    }
+    const size = this.off - start, n = this.cd.length, z = new DataView(new ArrayBuffer(22));
+    z.setUint32(0, 0x06054b50, true); z.setUint16(8, n, true); z.setUint16(10, n, true);
+    z.setUint32(12, size, true); z.setUint32(16, start, true);
+    await this._w(new Uint8Array(z.buffer));
+  }
+}
+
+async function czipRun(ids, zname, jobId, ctl, fsHandle) {
+  // returns true = done, false = shuru hone se pehle fail (server ZIP par fallback karo)
+  const tr = await fetch('/api/tree', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids, zip: true }), cache: 'no-store' });
+  const tree = await tr.json();
+  if (!tr.ok) throw new Error(tree.error || 'List nahi ban saki');
+  let token = tree.token, tokenExp = Date.now() + (tree.expires_in - 60) * 1000;
+  if (_zipJobId !== jobId) return true;
+  const entries = tree.entries, files = entries.filter((e) => !e.d);
+  const total = files.reduce((a, f) => a + (f.s || 0), 0);
+  if (total > CZ_ZIP_MAX) { toast('4GB se badi ZIP browser mein nahi banti, server route use ho raha hai'); return false; }
+
+  async function getToken() {
+    if (Date.now() > tokenExp) {
+      const r = await fetch('/api/token', { cache: 'no-store' }); const d = await r.json();
+      if (!r.ok) throw new Error('Token refresh fail');
+      token = d.token; tokenExp = Date.now() + (d.expires_in - 60) * 1000;
+    }
+    return token;
+  }
+  const urlOf = (f, t) => {
+    const b = 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(f.id);
+    return f.x ? b + '/export?mimeType=' + encodeURIComponent(f.x) + '&access_token=' + encodeURIComponent(t)
+               : b + '?alt=media&supportsAllDrives=true&access_token=' + encodeURIComponent(t);
+  };
+
+  // probe: CORS / token chal raha hai ya nahi - kuch likhne se pehle check
+  if (files.length) {
+    try {
+      const f = files.find((x) => x.s > 0 || x.x) || files[0];
+      const r = await fetch(urlOf(f, await getToken()), { headers: f.x ? {} : { Range: 'bytes=0-0' }, signal: ctl.signal });
+      if (!r.ok) throw new Error('probe ' + r.status);
+      if (r.body) r.body.cancel().catch(() => {});
+    } catch (e) { console.warn('client zip probe failed', e); return false; }
+  }
+
+  // output: desktop Chrome = seedha disk (RAM zero), baaki = Blob parts
+  let sink, finishOut;
+  const useFS = !!fsHandle;
+  if (!useFS && total > CZ_BLOB_MAX) { toast('Badi ZIP (2GB+) is device par browser mein nahi banti, server route use ho raha hai'); return false; }
+  if (useFS) {
+    const w = await fsHandle.createWritable();
+    sink = (u8) => w.write(u8);
+    finishOut = async () => { await w.close(); };
+    ctl.abortOut = () => w.abort().catch(() => {});
+  } else {
+    const parts = [];
+    sink = (u8) => { parts.push(new Blob([u8])); };
+    finishOut = async () => {
+      const url = URL.createObjectURL(new Blob(parts, { type: 'application/zip' }));
+      const a = document.createElement('a'); a.href = url; a.download = zname;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10 * 60 * 1000);
+    };
+  }
+
+  // saare segments ka plan (order mein), window tak parallel prefetch
+  const tasks = [];
+  for (const f of files) {
+    f.segs = [];
+    if (f.x) f.segs.push([0, 0]);
+    else for (let st = 0; st < f.s; st += CZ_SEG) f.segs.push([st, Math.min(st + CZ_SEG, f.s) - 1]);
+    for (const sg of f.segs) tasks.push([f, sg[0], sg[1]]);
+  }
+  async function fetchSeg(f, st, en) {
+    let last;
+    for (let a = 0; a < 5; a++) {
+      if (ctl.signal.aborted) throw new Error('cancelled');
+      try {
+        const r = await fetch(urlOf(f, await getToken()), { headers: f.x ? {} : { Range: 'bytes=' + st + '-' + en }, signal: ctl.signal });
+        if (r.status === 401) { tokenExp = 0; throw new Error('401'); }
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const buf = await r.arrayBuffer();
+        if (!f.x && buf.byteLength !== en - st + 1) throw new Error('short read');
+        return new Uint8Array(buf);
+      } catch (e) { last = e; if (ctl.signal.aborted) throw e; await new Promise((res) => setTimeout(res, Math.min(2 ** a, 8) * 400)); }
+    }
+    throw last;
+  }
+  const pending = []; let next = 0;
+  const fill = () => { while (pending.length < CZ_WINDOW && next < tasks.length) { const t = tasks[next++]; const p = fetchSeg(t[0], t[1], t[2]); p.catch(() => {}); pending.push(p); } };
+
+  const zw = new ZipWriter(sink), errors = []; let doneBytes = 0, doneFiles = 0;
+  try {
+    for (const e of entries) {
+      if (_zipJobId !== jobId) throw new Error('cancelled');
+      if (e.d) { const ent = await zw.startFile(e.p, true); await zw.endFile(ent); continue; }
+      zipCurFile.textContent = e.p.split('/').pop();
+      const ent = await zw.startFile(e.p, false);
+      let crc = 0xFFFFFFFF, failed = null;
+      for (let i = 0; i < e.segs.length; i++) {
+        fill();
+        let data = null;
+        try { data = await pending.shift(); } catch (err) { if (ctl.signal.aborted) throw err; failed = failed || err; }
+        fill();
+        if (failed || !data) continue;
+        crc = crcUpdate(crc, data); ent.size += data.length;
+        await sink(data); zw.off += data.length;
+        doneBytes += data.length;
+        const pct = total > 0 ? Math.min(99, Math.floor(doneBytes / total * 100)) : 0;
+        zipSetProgress(pct, doneFiles + ' / ' + files.length + ' files \u00b7 ' + _mb(doneBytes));
+      }
+      ent.crc = (crc ^ 0xFFFFFFFF) >>> 0;
+      if (failed) errors.push('Download fail: ' + e.p + ' (' + failed.message + ')');
+      await zw.endFile(ent); doneFiles++;
+    }
+    for (const m of tree.errors || []) errors.push(m);
+    if (errors.length) {
+      const ent = await zw.startFile('_errors.txt', false), data = new TextEncoder().encode(errors.join('\n'));
+      ent.size = data.length; ent.crc = (crcUpdate(0xFFFFFFFF, data) ^ 0xFFFFFFFF) >>> 0;
+      await sink(data); zw.off += data.length; await zw.endFile(ent);
+    }
+    await zw.finish();
+    await finishOut();
+  } catch (err) { ctl.abort(); if (ctl.abortOut) ctl.abortOut(); throw err; }
+  zipSetProgress(100, files.length + ' files \u00b7 ' + _mb(doneBytes), '\u2705 Ho gaya! Browser ke Downloads check karo');
+  _zipJobId = null; setTimeout(zipPanelHide, 3500);
+  return true;
+}
+
+async function zipDl(ids) {
+  clearTimeout(_zipPollTimer);
+  const one = ids.length === 1 && byId(ids[0]);
+  const d = new Date(), p2 = (n) => String(n).padStart(2, '0');
+  const zname = (one && one.mimeType === FOLDER ? one.name.replace(/[\\/:*?"<>|]/g, '_') : 'Drive_files_' + d.getFullYear() + p2(d.getMonth() + 1) + p2(d.getDate()) + '_' + p2(d.getHours()) + p2(d.getMinutes())) + '.zip';
+  // Desktop Chrome: Save dialog click ke turant baad (user gesture ke andar) kholna zaroori hai
+  let fsHandle = null;
+  if (window.showSaveFilePicker) {
+    try { fsHandle = await window.showSaveFilePicker({ suggestedName: zname, types: [{ description: 'ZIP', accept: { 'application/zip': ['.zip'] } }] }); }
+    catch (e) { if (e && e.name === 'AbortError') return; fsHandle = null; }
+  }
+  const jobId = 'c' + Math.random().toString(16).slice(2);
+  _zipJobId = jobId;
+  zipName.textContent = zname;
+  zipSetProgress(0, '', 'Files ki list ban rahi hai\u2026');
+  zipPanelShow();
+  const ctl = new AbortController();
+  $('#zipPanelClose').onclick = () => { _zipJobId = null; ctl.abort(); if (ctl.abortOut) ctl.abortOut(); clearTimeout(_zipPollTimer); zipPanelHide(); };
+  czipRun(ids, zname, jobId, ctl, fsHandle).then((ok) => { if (!ok && _zipJobId === jobId) zipDlServer(ids); })
+    .catch((e) => { if (_zipJobId === jobId) _zipFail((e && e.message) || 'ZIP fail ho gayi'); });
 }
 
 function openFile(f) {
@@ -814,8 +1017,9 @@ function openMenu(f, x, y) {
   const rows = [
     [isF ? 'Open folder' : 'Open file', 'open', () => (isF ? openFolder(f.id, f.name) : openFile(f))],
     ...(isF ? [
-      ['ZIP via Google Drive (fastest)', 'zip', () => { window.open('https://drive.google.com/drive/folders/' + encodeURIComponent(f.id), '_blank', 'noopener'); toast('Drive khul gaya: folder par right-click \u2192 Download dabao, Google khud ZIP banayega'); }],
-      ['Download files separately', 'download', () => zipDl([f.id])]
+      ['Download as ZIP', 'zip', () => zipDl([f.id])],
+      ['ZIP via Google Drive', 'zip', () => { window.open('https://drive.google.com/drive/folders/' + encodeURIComponent(f.id), '_blank', 'noopener'); toast('Drive khul gaya: folder par right-click \u2192 Download dabao, Google khud ZIP banayega'); }],
+      ['Download files separately', 'download', () => zipSeparate([f.id])]
     ] : [['Download', 'download', () => dl(f.id)]]),
     ['Rename', 'edit', () => renameFile(f)],
     ['Select', 'select', () => { state.selMode = true; toggleSel(f.id, true); }],
@@ -1378,6 +1582,25 @@ def iter_file(svc, file_id, mime):
             yield data
 
 
+def _is_public(meta):
+    return any(p.get("type") == "anyone" for p in (meta.get("permissions") or []))
+
+
+def public_url(file_id, mime):
+    """Public file ka seedha Drive-web link: na token, na Render. Google Docs ke liye export link."""
+    fid = quote(file_id, safe="")
+    if mime == "application/vnd.google-apps.document":
+        return f"https://docs.google.com/document/d/{fid}/export?format=pdf"
+    if mime == "application/vnd.google-apps.spreadsheet":
+        return f"https://docs.google.com/spreadsheets/d/{fid}/export?format=xlsx"
+    if mime == "application/vnd.google-apps.presentation":
+        return f"https://docs.google.com/presentation/d/{fid}/export/pdf"
+    if mime == "application/vnd.google-apps.drawing":
+        return f"https://docs.google.com/drawings/d/{fid}/export/pdf"
+    # confirm=t -> badi files par "virus scan nahi ho saka" wala page skip
+    return f"https://drive.usercontent.google.com/download?id={fid}&export=download&confirm=t"
+
+
 def _fresh_token():
     """(access_token, expires_in_seconds) - kam se kam ~10 min chalne wala."""
     creds = get_creds()
@@ -1400,7 +1623,9 @@ def api_token():
 @app.post("/api/tree")
 def api_tree():
     """Folder/selection ki flat file list (sirf metadata) + token. File data Render se nahi guzarta."""
-    ids = (request.get_json(silent=True) or {}).get("ids")
+    body = request.get_json(silent=True) or {}
+    ids = body.get("ids")
+    zip_mode = bool(body.get("zip"))
     if not isinstance(ids, list) or not ids:
         return jsonify(error="Kuch select nahi hai"), 400
     ids = [safe_id(i) for i in ids[:5000]]
@@ -1408,7 +1633,7 @@ def api_tree():
 
     def get_meta(i):
         return _thread_drive().files().get(
-            fileId=i, fields="id,name,mimeType,size", supportsAllDrives=True
+            fileId=i, fields="id,name,mimeType,size,permissions(type)", supportsAllDrives=True
         ).execute()
 
     with ThreadPoolExecutor(max_workers=min(8, len(ids))) as p:
@@ -1417,11 +1642,18 @@ def api_tree():
     for path, m in walk(svc, metas, errors):
         if m is None:
             out.append({"p": path, "d": 1})
-        elif m["mimeType"] in EXPORTS:
-            out.append({"p": path, "id": m["id"], "s": 0, "x": EXPORTS[m["mimeType"]][0]})
         else:
-            out.append({"p": path, "id": m["id"], "s": int(m.get("size") or 0)})
-    t, left = _fresh_token()
+            e = {"p": path, "id": m["id"]}
+            if m["mimeType"] in EXPORTS:
+                e.update(s=0, x=EXPORTS[m["mimeType"]][0])
+            else:
+                e["s"] = int(m.get("size") or 0)
+            if _is_public(m):
+                e["u"] = public_url(m["id"], m["mimeType"])  # bina token, seedha Drive web
+            out.append(e)
+    # browser-ZIP ko CORS wala API link chahiye (public link se JS data nahi padh sakta)
+    need_token = zip_mode or any(("u" not in e) for e in out if not e.get("d"))
+    t, left = _fresh_token() if need_token else (None, 0)
     r = jsonify(entries=out, errors=errors, token=t, expires_in=left)
     r.headers["Cache-Control"] = "no-store"
     return r
@@ -1434,11 +1666,15 @@ def direct_link(file_id):
         return jsonify(error="direct off"), 404
     file_id = safe_id(file_id)
     meta = drive().files().get(
-        fileId=file_id, fields="id,name,mimeType", supportsAllDrives=True
+        fileId=file_id, fields="id,name,mimeType,permissions(type)", supportsAllDrives=True
     ).execute()
     mime = meta["mimeType"]
     if mime == FOLDER_MIME:
         return jsonify(error="Folder ke liye ZIP download use karo"), 400
+    if _is_public(meta) and (mime in EXPORTS or not mime.startswith("application/vnd.google-apps.")):
+        resp = jsonify(url=public_url(file_id, mime), name=meta["name"], public=True)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
 
     token = _fresh_token()[0]
 
@@ -1532,7 +1768,7 @@ def list_children(svc, folder_id):
                 q=f"'{folder_id}' in parents and trashed = false",
                 pageSize=1000,
                 pageToken=token,
-                fields="nextPageToken,files(id,name,mimeType,size)",
+                fields="nextPageToken,files(id,name,mimeType,size,permissions(type))",
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
             )
